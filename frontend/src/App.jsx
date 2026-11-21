@@ -1,658 +1,329 @@
-import React, { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import {
-  FileText,
-  Upload,
-  Search,
-  CheckCircle2,
-  AlertCircle,
-  ExternalLink,
-  Layers,
-  RefreshCw,
-  BarChart3,
-  Terminal,
-  Clock,
-  Zap,
-  Globe
+  ArrowDownToLine, ArrowRight, BarChart3, CheckCircle2, CircleAlert, FileText, FlaskConical,
+  FolderOpen, GitCompareArrows, Globe, Layers, ListFilter, Search, ShieldCheck, Upload,
 } from 'lucide-react';
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-  Cell
-} from 'recharts';
+import './App.css';
 
-const BACKEND_URL = 'http://127.0.0.1:8000';
+const outcomes = {
+  supported: { label: 'Supported answer', icon: CheckCircle2 },
+  conflict: { label: 'Conflicting sources', icon: GitCompareArrows },
+  insufficient: { label: 'Insufficient evidence', icon: CircleAlert },
+};
+const metrics = { bm25_only: 'BM25', vector_only: 'Local vector', hybrid_rrf: 'Hybrid RRF' };
+
+async function api(path, options) {
+  let response;
+  try {
+    response = await fetch(`/api${path}`, options);
+  } catch {
+    throw new Error('Could not reach DataScout. Check that the server is running.');
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(typeof body?.detail === 'string' ? body.detail : 'DataScout could not complete this request.');
+  }
+  return response.json();
+}
+
+function EvidenceCard({ item, index, workspace, conflicting }) {
+  const label = item.page ? `${item.source} · p. ${item.page}` : item.source;
+  const link = item.url || (workspace === 'demo'
+    ? `/api/demo/documents/${encodeURIComponent(item.source)}#page=${item.page}`
+    : null);
+  return (
+    <li className={conflicting ? 'evidence-card conflicting' : 'evidence-card'}>
+      <div className="evidence-meta">
+        <span className="citation-num">{index + 1}</span>
+        <span>{label}</span>
+        {link && <a href={link} target="_blank" rel="noreferrer" aria-label={`Open ${label}`}>
+          <ArrowRight size={16} />
+        </a>}
+      </div>
+      {item.value && conflicting && <strong className="evidence-value">{item.value}</strong>}
+      <blockquote>{item.quote}</blockquote>
+    </li>
+  );
+}
+
+function Result({ result, workspace }) {
+  const { label, icon: Icon } = outcomes[result.verdict];
+  return (
+    <section className="result" aria-labelledby="result-heading">
+      <div className="result-info">
+        <span className={`status ${result.verdict}`}><Icon size={15} /> {label}</span>
+        <span className="muted timing">{result.latency_ms} ms{result.cache_hit ? ' · Cached' : ''}</span>
+      </div>
+      <h2 id="result-heading">{result.question}</h2>
+      <p className="muted result-scope">Searched {result.scope || (workspace === 'demo' ? 'all demo notices' : 'all uploaded PDFs')}</p>
+      {result.source_mode === 'web_fallback' && <p className="web-label"><Globe size={15} /> Public web answer for “{result.publicQuestion}”</p>}
+      <p className="answer">{result.answer}</p>
+      {result.evidence.length > 0 && (
+        <>
+          <h3>{result.source_mode === 'web_fallback' ? 'Web evidence' : 'Document evidence'}</h3>
+          <ul className="evidence-list">
+            {result.evidence.map((item, index) => (
+              <EvidenceCard key={`${item.chunk_id || item.url}-${index}`} item={item}
+                index={index} workspace={workspace} conflicting={result.verdict === 'conflict'} />
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
+  );
+}
+
+function Inspector({ result }) {
+  return (
+    <aside className="inspector">
+      <h2><Layers size={17} /> Retrieval trace</h2>
+      {!result ? (
+        <p className="muted">Run a question to see how DataScout searched and assessed the evidence.</p>
+      ) : (
+        <>
+          <ol className="trace">
+            {result.trace_steps.map((step, i) => <li key={i}>{step}</li>)}
+          </ol>
+          {result.chunks.length > 0 && <details>
+            <summary>Retrieved passages ({result.chunks.length})</summary>
+            <p className="muted">Rank fusion orders passages. Rank scores measure retrieval priority.</p>
+            <ul className="passages">
+              {result.chunks.map((chunk) => <li key={chunk.chunk_id}>
+                <strong>{chunk.source} · p. {chunk.page}</strong>
+                <small>BM25 {chunk.bm25_rank ?? '—'} · Vector {chunk.vector_rank ?? '—'} · RRF {chunk.rrf_score}</small>
+                <p>{chunk.text}</p>
+              </li>)}
+            </ul>
+          </details>}
+        </>
+      )}
+    </aside>
+  );
+}
+
+function Evaluation() {
+  const [state, setState] = useState({});
+  useEffect(() => {
+    let active = true;
+    api('/analytics').then((data) => { if (active) setState({ data: data.benchmarks }); })
+      .catch((error) => { if (active) setState({ error: error.message }); });
+    return () => { active = false; };
+  }, []);
+  const data = state.data;
+  return (
+    <section className="evaluation">
+      <p className="eyebrow"><FlaskConical size={15} /> FICTIONAL DEMO CORPUS</p>
+      <h1>Evaluation</h1>
+      {state.error && <p role="alert" className="error">{state.error}</p>}
+      {!data && !state.error && <p role="status">Running benchmark…</p>}
+      {data && <>
+        <div className="metric-row">
+          <div><strong>{data.correct}/{data.cases.length}</strong><span>Verdicts and citations matched</span></div>
+          <div><strong>{data.retrieval_cases}</strong><span>Labelled retrieval cases</span></div>
+          <div><strong>{data.p95_latency_ms} ms</strong><span>P95 local query time</span></div>
+        </div>
+        <h2>Retrieval on the original question</h2>
+        <div className="table-scroll"><table>
+          <thead><tr><th>Method</th><th>Recall@{data.k}</th><th>Precision@{data.k}</th><th>MRR</th></tr></thead>
+          <tbody>{Object.entries(data.metrics).map(([method, row]) => <tr key={method}>
+            <th scope="row">{metrics[method]}</th><td>{row.recall}</td><td>{row.precision}</td><td>{row.mrr}</td>
+          </tr>)}</tbody>
+        </table></div>
+        <h2>Expected and observed results</h2>
+        <div className="table-scroll"><table>
+          <thead><tr><th>Question</th><th>Expected</th><th>Observed</th><th>Check</th></tr></thead>
+          <tbody>{data.cases.map((item, i) => <tr key={i}>
+            <th scope="row">{item.question}{item.scope.length > 0 && <small>{item.scope.join(', ')}</small>}</th>
+            <td>{item.expected}</td><td>{item.actual}</td><td>{item.correct ? 'Pass' : 'Review'}</td>
+          </tr>)}</tbody>
+        </table></div>
+      </>}
+    </section>
+  );
+}
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('workbench'); // 'workbench' | 'evaluation'
+  const [tab, setTab] = useState('workbench');
+  const [workspace, setWorkspace] = useState('demo');
+  const [demo, setDemo] = useState({ documents: [], examples: [] });
   const [documents, setDocuments] = useState([]);
+  const [health, setHealth] = useState(null);
+  const [loadError, setLoadError] = useState('');
+  const [query, setQuery] = useState('');
+  const [scope, setScope] = useState('');
+  const [publicQuery, setPublicQuery] = useState('');
+  const [advanced, setAdvanced] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState(null);
-
-  // Search & Query state
-  const [query, setQuery] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [queryResult, setQueryResult] = useState(null);
-
-  // Analytics & Benchmark state
-  const [analytics, setAnalytics] = useState(null);
-  const [loadingAnalytics, setLoadingAnalytics] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState(null);
+  const currentDocuments = workspace === 'demo' ? demo.documents : documents;
 
   useEffect(() => {
-    fetchDocuments();
-    fetchAnalytics();
+    let active = true;
+    Promise.allSettled([api('/health'), api('/demo'), api('/documents')]).then(([server, pack, docs]) => {
+      if (!active) return;
+      if (server.status === 'fulfilled') setHealth(server.value);
+      if (pack.status === 'fulfilled') setDemo(pack.value);
+      if (docs.status === 'fulfilled') setDocuments(docs.value);
+      const failure = [server, pack, docs].find((item) => item.status === 'rejected');
+      if (failure) setLoadError(failure.reason.message);
+    });
+    return () => { active = false; };
   }, []);
 
-  const fetchDocuments = async () => {
-    try {
-      const res = await fetch(`${BACKEND_URL}/documents`);
-      if (res.ok) {
-        const data = await res.json();
-        setDocuments(data);
-      }
-    } catch (err) {
-      console.error('Error fetching documents:', err);
-    }
-  };
+  function switchWorkspace(next) {
+    if (next === workspace) return;
+    setWorkspace(next);
+    setScope('');
+    setQuery('');
+    setResult(null);
+    setError('');
+    setUploadStatus(null);
+    setPublicQuery('');
+    setAdvanced(false);
+  }
 
-  const fetchAnalytics = async () => {
-    setLoadingAnalytics(true);
+  async function ask(event) {
+    event.preventDefault();
+    if (!query.trim() || busy) return;
+    const question = query.trim();
+    const publicQuestion = workspace === 'documents' && advanced ? publicQuery.trim() : '';
+    setBusy(true);
+    setError('');
+    setResult(null);
     try {
-      const res = await fetch(`${BACKEND_URL}/analytics`);
-      if (res.ok) {
-        const data = await res.json();
-        setAnalytics(data);
-      }
-    } catch (err) {
-      console.error('Error fetching analytics:', err);
+      const data = await api('/query', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: question, workspace, sources: scope ? [scope] : [],
+          public_web_query: publicQuestion || null,
+        }),
+      });
+      setResult({ ...data, question, publicQuestion, scope });
+    } catch (failure) {
+      setError(failure.message);
     } finally {
-      setLoadingAnalytics(false);
+      setBusy(false);
     }
-  };
+  }
 
-  const handleFileUpload = async (e) => {
-    const file = e.target.files?.[0];
+  async function upload(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
     if (!file) return;
-
-    if (!file.name.toLowerCase().endsWith('.pdf')) {
-      setUploadStatus({ type: 'error', message: 'Only PDF files are supported' });
-      return;
-    }
-
     setUploading(true);
     setUploadStatus(null);
-    const formData = new FormData();
-    formData.append('file', file);
-
+    const body = new FormData();
+    body.append('file', file);
     try {
-      const res = await fetch(`${BACKEND_URL}/documents/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setUploadStatus({
-          type: 'success',
-          message: `Indexed ${data.chunks_indexed} chunks from ${data.filename}`,
-        });
-        fetchDocuments();
-        fetchAnalytics();
-      } else {
-        const err = await res.json();
-        setUploadStatus({ type: 'error', message: err.detail || 'Upload failed' });
-      }
-    } catch (err) {
-      setUploadStatus({ type: 'error', message: 'Failed to connect to backend server' });
+      const uploaded = await api('/documents/upload', { method: 'POST', body });
+      setDocuments(await api('/documents'));
+      setResult(null);
+      setUploadStatus({ text: `Indexed ${uploaded.filename} · ${uploaded.page_count} pages` });
+    } catch (failure) {
+      setUploadStatus({ text: failure.message, error: true });
     } finally {
       setUploading(false);
     }
-  };
-
-  const handleQuery = async (e) => {
-    e.preventDefault();
-    if (!query.trim() || loading) return;
-
-    setLoading(true);
-    try {
-      const res = await fetch(`${BACKEND_URL}/query`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: query.trim(), top_k: 5 }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setQueryResult(data);
-        fetchAnalytics();
-      }
-    } catch (err) {
-      console.error('Query execution error:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
+  }
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F6F5F0] text-[#111111]">
-      {/* Top Header Grid */}
-      <header className="border-b border-[#D4D2C8] bg-[#F6F5F0] px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center space-x-3">
-          <div className="w-5 h-5 bg-[#FF4F00] flex items-center justify-center text-white text-xs font-bold font-mono">
-            D
-          </div>
-          <span className="font-mono text-sm tracking-widest font-bold uppercase">
-            DATASCOUT // AUDITABLE HYBRID RAG
-          </span>
-          <span className="text-xs bg-[#E5E3D8] border border-[#D4D2C8] px-2 py-0.5 font-mono text-[#555555]">
-            RRF-K60
-          </span>
-        </div>
-
-        {/* Tab Switcher */}
-        <div className="flex items-center border border-[#D4D2C8] bg-[#EBE9DE]">
-          <button
-            onClick={() => setActiveTab('workbench')}
-            className={`px-4 py-1.5 text-xs font-mono font-medium flex items-center space-x-2 transition-colors ${
-              activeTab === 'workbench'
-                ? 'bg-[#111111] text-[#F6F5F0]'
-                : 'text-[#555555] hover:text-[#111111]'
-            }`}
-          >
-            <Layers className="w-3.5 h-3.5" />
-            <span>RETRIEVAL WORKBENCH</span>
+    <div className="app">
+      <header className="header">
+        <div className="brand"><span className="brand-icon"><ShieldCheck size={21} /></span><strong>DataScout</strong></div>
+        <nav aria-label="Main navigation">
+          <button aria-current={tab === 'workbench' ? 'page' : undefined} onClick={() => setTab('workbench')}>
+            <Layers size={16} /> Workbench
           </button>
-          <button
-            onClick={() => {
-              setActiveTab('evaluation');
-              fetchAnalytics();
-            }}
-            className={`px-4 py-1.5 text-xs font-mono font-medium flex items-center space-x-2 transition-colors ${
-              activeTab === 'evaluation'
-                ? 'bg-[#111111] text-[#F6F5F0]'
-                : 'text-[#555555] hover:text-[#111111]'
-            }`}
-          >
-            <BarChart3 className="w-3.5 h-3.5" />
-            <span>EVALUATION BENCHMARK</span>
+          <button aria-current={tab === 'evaluation' ? 'page' : undefined} onClick={() => setTab('evaluation')}>
+            <BarChart3 size={16} /> Evaluation
           </button>
-        </div>
+        </nav>
+        <span className="header-state"><i className={health ? 'connected' : ''} /> {health ? 'Server connected' : 'Server status'}</span>
       </header>
 
-      {/* Main Content Area */}
-      {activeTab === 'workbench' ? (
-        <main className="flex-1 grid grid-cols-12 min-h-0 divide-x divide-[#D4D2C8]">
-          {/* LEFT PANE: Document Ingestion & KB Status */}
-          <aside className="col-span-3 p-5 flex flex-col space-y-6">
-            <div className="space-y-1">
-              <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[#555555]">
-                01 // KNOWLEDGE BASE INGESTION
-              </h2>
-              <p className="text-xs text-[#777777]">
-                PyMuPDF 500-char sliding window with 50-char overlap.
-              </p>
+      {tab === 'evaluation' ? <main><Evaluation /></main> : (
+        <main className="workbench">
+          <aside className="library">
+            <h2><FolderOpen size={18} /> Source library</h2>
+            <div className="segmented" aria-label="Source workspace">
+              <button aria-pressed={workspace === 'demo'} disabled={busy || uploading}
+                onClick={() => switchWorkspace('demo')}>Demo notices</button>
+              <button aria-pressed={workspace === 'documents'} disabled={busy || uploading}
+                onClick={() => switchWorkspace('documents')}>My PDFs</button>
             </div>
+            {workspace === 'documents' && <>
+              <label className="upload">
+                <Upload size={17} /> {uploading ? 'Indexing…' : 'Upload PDF'}
+                <input type="file" accept=".pdf,application/pdf" disabled={uploading || busy} onChange={upload} />
+              </label>
+              <p className="muted limits">Text PDFs up to 10 MB and 120 pages. Uploading the same filename replaces it.</p>
+              {uploadStatus && <p role={uploadStatus.error ? 'alert' : 'status'}
+                className={uploadStatus.error ? 'error' : 'upload-success'}>{uploadStatus.text}</p>}
+            </>}
+            {currentDocuments.length > 0 ? <ul className="document-list">
+              {currentDocuments.map((doc) => <li key={doc.filename} className={scope === doc.filename ? 'selected' : ''}>
+                <FileText size={17} />
+                <div><strong>{doc.filename}</strong><small>{doc.page_count} pages · {doc.chunk_count} passages</small></div>
+                {workspace === 'demo' && <a href={`/api/demo/documents/${encodeURIComponent(doc.filename)}`}
+                  target="_blank" rel="noreferrer" aria-label={`Open ${doc.filename}`}><ArrowDownToLine size={16} /></a>}
+              </li>)}
+            </ul> : <p className="muted">{workspace === 'demo' ? 'Loading demo notices…' : 'Upload a PDF to build your source library.'}</p>}
+            {workspace === 'demo' && <p className="library-note"><FlaskConical size={15} /> These are fictional campus notices.</p>}
+            {workspace === 'documents' && health?.gemini_configured && <p className="library-note">
+              <Globe size={15} /> Gemini is enabled. Questions and relevant document text may be sent to Gemini.
+            </p>}
+          </aside>
 
-            {/* Drag & Drop Upload Card */}
-            <div className="border border-dashed border-[#B5B3A6] bg-[#EFECE1] p-5 text-center relative hover:bg-[#EAE6D8] transition-colors">
-              <input
-                type="file"
-                accept=".pdf"
-                onChange={handleFileUpload}
-                disabled={uploading}
-                className="absolute inset-0 opacity-0 cursor-pointer"
-              />
-              <Upload className="w-6 h-6 mx-auto mb-2 text-[#777777]" />
-              <p className="text-xs font-mono font-semibold uppercase">
-                {uploading ? 'INGESTING & EMBEDDING...' : 'DROP PDF TO INDEX'}
-              </p>
-              <p className="text-[11px] text-[#777777] mt-1">
-                Generates Gemini embeddings & BM25 tokens
-              </p>
-            </div>
-
-            {uploadStatus && (
-              <div
-                className={`p-3 border text-xs font-mono flex items-start space-x-2 ${
-                  uploadStatus.type === 'success'
-                    ? 'bg-[#EBF7EE] border-[#72C185] text-[#1B642C]'
-                    : 'bg-[#FBEBEB] border-[#E88E8E] text-[#9A2222]'
-                }`}
-              >
-                {uploadStatus.type === 'success' ? (
-                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
-                ) : (
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                )}
-                <span>{uploadStatus.message}</span>
-              </div>
-            )}
-
-            {/* Indexed Document List */}
-            <div className="flex-1 flex flex-col space-y-2 overflow-hidden">
-              <div className="flex items-center justify-between border-b border-[#D4D2C8] pb-1">
-                <span className="text-[11px] font-mono uppercase text-[#777777]">
-                  INDEXED SOURCES ({documents.length})
-                </span>
-                <button
-                  onClick={fetchDocuments}
-                  className="p-1 hover:text-[#FF4F00] text-[#777777]"
-                >
-                  <RefreshCw className="w-3 h-3" />
+          <div className="main-panel">
+            <section className="intro">
+              <p className="eyebrow">{workspace === 'demo' ? 'CAMPUS INNOVATION CHALLENGE' : 'DOCUMENT WORKSPACE'}</p>
+              <h1>Find the answer.<br />Check the notice.</h1>
+              <p>{workspace === 'demo'
+                ? 'Ask about registration, then inspect the exact text behind the result.'
+                : 'Ask a question and trace the answer back to the source page.'}</p>
+            </section>
+            {loadError && <p role="alert" className="error">{loadError}</p>}
+            <form onSubmit={ask} className="question-form">
+              <label htmlFor="question">Your question</label>
+              <textarea id="question" value={query} onChange={(e) => setQuery(e.target.value)}
+                maxLength={1000} rows={2} placeholder="What is the team registration deadline?" required disabled={busy} />
+              <div className="form-actions">
+                <div className="scope"><ListFilter size={15} /><label htmlFor="scope" className="sr-only">Search scope</label>
+                  <select id="scope" value={scope} onChange={(e) => setScope(e.target.value)} disabled={busy}>
+                    <option value="">All {workspace === 'demo' ? 'demo notices' : 'uploaded PDFs'}</option>
+                    {currentDocuments.map((doc) => <option key={doc.filename}>{doc.filename}</option>)}
+                  </select>
+                </div>
+                <button type="submit" className="primary" disabled={!query.trim() || busy || uploading}>
+                  <Search size={16} /> {busy ? 'Checking…' : 'Check evidence'}
                 </button>
               </div>
-
-              <div className="space-y-2 overflow-y-auto pr-1">
-                {documents.length === 0 ? (
-                  <div className="text-xs text-[#888888] font-mono p-4 border border-[#D4D2C8] bg-[#EAE8DE] text-center">
-                    No documents indexed yet. Upload a PDF or run benchmarks.
-                  </div>
-                ) : (
-                  documents.map((doc, idx) => (
-                    <div
-                      key={idx}
-                      className="border border-[#D4D2C8] bg-[#FAF9F5] p-3 flex flex-col space-y-1"
-                    >
-                      <div className="flex items-center space-x-2">
-                        <FileText className="w-3.5 h-3.5 text-[#FF4F00] shrink-0" />
-                        <span className="text-xs font-mono font-medium truncate">
-                          {doc.filename}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between text-[11px] font-mono text-[#666666]">
-                        <span>CHUNKS:</span>
-                        <span className="bg-[#EAE7DC] px-1.5 py-0.2 border border-[#D4D2C8] text-[#111111]">
-                          {doc.chunk_count}
-                        </span>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </aside>
-
-          {/* CENTER PANE: Query Input & Grounded Response */}
-          <section className="col-span-5 p-5 flex flex-col space-y-5">
-            <div className="space-y-1">
-              <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[#555555]">
-                02 // RETRIEVAL & ANSWER GENERATION
-              </h2>
-              <p className="text-xs text-[#777777]">
-                Self-correcting LangGraph loop with hybrid RRF and Tavily web fallback.
-              </p>
-            </div>
-
-            {/* Query Form */}
-            <form onSubmit={handleQuery} className="flex border border-[#111111]">
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Ask about system architecture, ERR codes, or web fallback..."
-                className="flex-1 bg-[#FAF9F5] px-3 py-2 text-xs font-mono outline-none text-[#111111] placeholder-[#888888]"
-              />
-              <button
-                type="submit"
-                disabled={loading || !query.trim()}
-                className="bg-[#111111] text-[#F6F5F0] px-4 py-2 text-xs font-mono font-bold uppercase hover:bg-[#FF4F00] transition-colors flex items-center space-x-1 disabled:opacity-50"
-              >
-                <Search className="w-3.5 h-3.5" />
-                <span>{loading ? 'RETRIEVING...' : 'EXECUTE'}</span>
-              </button>
+              {workspace === 'documents' && health?.web_configured && (
+                <div className="public-search">
+                  <label><input type="checkbox" checked={advanced} onChange={(e) => setAdvanced(e.target.checked)}
+                    disabled={busy} /> Try a separate public web query if documents fall short</label>
+                  {advanced && <input aria-label="Public web query" placeholder="Enter a question safe to send to Tavily"
+                    maxLength={300} required value={publicQuery} onChange={(e) => setPublicQuery(e.target.value)} disabled={busy} />}
+                </div>
+              )}
             </form>
-
-            {/* Telemetry Bar */}
-            {queryResult && (
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-3 flex items-center justify-between font-mono text-xs">
-                <div className="flex items-center space-x-2">
-                  <span className="text-[#666666]">SOURCE:</span>
-                  <span
-                    className={`px-2 py-0.5 text-[11px] font-bold border ${
-                      queryResult.source_mode === 'kb'
-                        ? 'bg-[#EBF7EE] border-[#72C185] text-[#1B642C]'
-                        : queryResult.source_mode === 'web_fallback'
-                        ? 'bg-[#FFF3E8] border-[#FFB67D] text-[#D84300]'
-                        : 'bg-[#EFECE1] border-[#D4D2C8] text-[#555555]'
-                    }`}
-                  >
-                    {queryResult.source_mode === 'kb'
-                      ? 'INTERNAL KB'
-                      : queryResult.source_mode === 'web_fallback'
-                      ? 'TAVILY WEB FALLBACK'
-                      : 'NO MATCH'}
-                  </span>
-                </div>
-
-                <div className="flex items-center space-x-4 text-[#555555]">
-                  <span className="flex items-center space-x-1">
-                    <Clock className="w-3 h-3" />
-                    <span>{queryResult.latency_ms} ms</span>
-                  </span>
-                  <span className="flex items-center space-x-1">
-                    <Zap className="w-3 h-3 text-[#FF4F00]" />
-                    <span>{queryResult.cache_hit ? 'CACHE HIT' : 'COLD RUN'}</span>
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {/* LangGraph Trace Steps */}
-            {queryResult && queryResult.trace_steps && (
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-3 space-y-2">
-                <div className="flex items-center space-x-2 border-b border-[#D4D2C8] pb-1">
-                  <Terminal className="w-3.5 h-3.5 text-[#555555]" />
-                  <span className="text-[11px] font-mono font-bold uppercase text-[#555555]">
-                    LANGGRAPH CORRECTIVE TRACE
-                  </span>
-                </div>
-                <div className="space-y-1 font-mono text-[11px]">
-                  {queryResult.trace_steps.map((step, idx) => (
-                    <div key={idx} className="flex items-start space-x-2">
-                      <span className="text-[#FF4F00] font-bold">[{idx + 1}]</span>
-                      <span className="text-[#333333]">{step}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Grounded Answer Card */}
-            <div className="flex-1 border border-[#D4D2C8] bg-[#FAF9F5] p-4 flex flex-col space-y-2 overflow-y-auto">
-              <div className="flex items-center justify-between border-b border-[#D4D2C8] pb-1">
-                <span className="text-[11px] font-mono uppercase text-[#777777]">
-                  GROUNDED SYNTHESIS
-                </span>
-                <span className="text-[10px] font-mono text-[#888888]">
-                  gemini-3.1-flash-lite
-                </span>
-              </div>
-              {queryResult ? (
-                <div className="text-xs leading-relaxed font-sans text-[#111111] whitespace-pre-wrap">
-                  {queryResult.answer}
-                </div>
-              ) : (
-                <div className="text-xs text-[#888888] font-mono text-center my-auto">
-                  Execute a query to inspect the grounded answer and LangGraph execution trace.
-                </div>
-              )}
+            {workspace === 'demo' && <div className="examples">
+              {demo.examples.map((example) => <button key={example.label} disabled={busy}
+                onClick={() => { setQuery(example.query); setScope(''); document.getElementById('question')?.focus(); }}>
+                {example.label} <ArrowRight size={13} />
+              </button>)}
+            </div>}
+            <div className="response-area" aria-live="polite" aria-busy={busy}>
+              {error && <p role="alert" className="error">{error}</p>}
+              {busy && <p role="status" className="muted">Checking sources for direct evidence…</p>}
+              {result && <Result result={result} workspace={workspace} />}
             </div>
-          </section>
-
-          {/* RIGHT PANE: X-Ray Inspector */}
-          <aside className="col-span-4 p-5 flex flex-col space-y-4 overflow-y-auto">
-            <div className="space-y-1">
-              <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[#555555]">
-                03 // X-RAY INSPECTOR
-              </h2>
-              <p className="text-xs text-[#777777]">
-                Per-chunk RRF scores, BM25 ranks, dense vector ranks, and relevance audit.
-              </p>
-            </div>
-
-            {/* Web Sources Cards (if Tavily Fallback triggered) */}
-            {queryResult && queryResult.web_sources && queryResult.web_sources.length > 0 && (
-              <div className="space-y-2 border border-[#FF4F00] p-3 bg-[#FFFBF7]">
-                <div className="flex items-center space-x-2 text-[#D84300] font-mono text-xs font-bold border-b border-[#FFE0CC] pb-1">
-                  <Globe className="w-3.5 h-3.5" />
-                  <span>TAVILY WEB SOURCES ({queryResult.web_sources.length})</span>
-                </div>
-                {queryResult.web_sources.map((ws, idx) => (
-                  <div key={idx} className="border border-[#FFE0CC] p-2 bg-white space-y-1">
-                    <a
-                      href={ws.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs font-mono font-bold text-[#D84300] hover:underline flex items-center space-x-1"
-                    >
-                      <span className="truncate">{ws.title}</span>
-                      <ExternalLink className="w-3 h-3 shrink-0" />
-                    </a>
-                    <p className="text-[11px] text-[#555555] line-clamp-2">
-                      {ws.snippet}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Retrieved Chunks Audit Cards */}
-            <div className="space-y-3">
-              <span className="text-[11px] font-mono uppercase text-[#777777] block border-b border-[#D4D2C8] pb-1">
-                RETRIEVED CHUNKS ({queryResult?.chunks?.length || 0})
-              </span>
-
-              {!queryResult || queryResult.chunks.length === 0 ? (
-                <div className="text-xs text-[#888888] font-mono p-4 border border-[#D4D2C8] bg-[#EAE8DE] text-center">
-                  No retrieval audit data to display.
-                </div>
-              ) : (
-                queryResult.chunks.map((c, idx) => (
-                  <div
-                    key={idx}
-                    className="border border-[#D4D2C8] bg-[#FAF9F5] p-3 flex flex-col space-y-2"
-                  >
-                    <div className="flex items-center justify-between text-xs font-mono">
-                      <span className="font-bold text-[#111111] truncate">{c.chunk_id}</span>
-                      <span
-                        className={`text-[10px] px-1.5 py-0.5 border ${
-                          c.is_relevant === true
-                            ? 'bg-[#EBF7EE] border-[#72C185] text-[#1B642C]'
-                            : c.is_relevant === false
-                            ? 'bg-[#FBEBEB] border-[#E88E8E] text-[#9A2222]'
-                            : 'bg-[#EAE7DC] border-[#D4D2C8] text-[#555555]'
-                        }`}
-                      >
-                        {c.is_relevant === true
-                          ? 'RELEVANT'
-                          : c.is_relevant === false
-                          ? 'IRRELEVANT'
-                          : 'UNGRADED'}
-                      </span>
-                    </div>
-
-                    {/* Metrics Row */}
-                    <div className="grid grid-cols-3 gap-1 bg-[#EFECE1] border border-[#D4D2C8] p-1.5 text-center font-mono text-[11px]">
-                      <div>
-                        <div className="text-[9px] text-[#777777]">RRF MATCH</div>
-                        <div className="font-bold text-[#FF4F00]">
-                          {/* Convert RRF raw score (max 2/61 = 0.032787) into an intuitive 0-100% confidence match */}
-                          {(Math.min(100, (c.rrf_score / 0.032787) * 100)).toFixed(1)}%
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] text-[#777777]">BM25 RANK</div>
-                        <div className="font-bold">
-                          {c.bm25_rank !== null ? `#${c.bm25_rank}` : '—'}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] text-[#777777]">VECTOR RANK</div>
-                        <div className="font-bold">
-                          {c.vector_rank !== null ? `#${c.vector_rank}` : '—'}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Chunk Snippet */}
-                    <p className="text-[11px] font-sans text-[#444444] bg-[#FAF9F5] border border-[#E5E3D8] p-2 leading-relaxed">
-                      {c.text}
-                    </p>
-
-                    <div className="flex items-center justify-between text-[10px] font-mono text-[#888888]">
-                      <span>SOURCE: {c.source}</span>
-                      <span>PAGE: {c.page}</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </aside>
-        </main>
-      ) : (
-        /* EVALUATION BENCHMARK TAB */
-        <main className="flex-1 p-8 max-w-6xl mx-auto w-full space-y-8">
-          <div className="flex items-center justify-between border-b border-[#D4D2C8] pb-4">
-            <div>
-              <h1 className="font-mono text-base font-bold uppercase tracking-wider">
-                RETRIEVAL BENCHMARKS & EVALUATION AUDIT
-              </h1>
-              <p className="text-xs text-[#666666] mt-0.5 font-mono">
-                Real measured metrics comparing Vector-only vs BM25-only vs Hybrid RRF
-              </p>
-            </div>
-            <button
-              onClick={fetchAnalytics}
-              disabled={loadingAnalytics}
-              className="px-3 py-1.5 border border-[#111111] bg-[#FAF9F5] text-xs font-mono font-bold flex items-center space-x-1.5 hover:bg-[#FF4F00] hover:text-white transition-colors"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loadingAnalytics ? 'animate-spin' : ''}`} />
-              <span>REFRESH METRICS</span>
-            </button>
           </div>
 
-          {/* Live Metrics Summary Cards */}
-          {analytics?.live_metrics && (
-            <div className="grid grid-cols-4 gap-4 font-mono">
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-4">
-                <div className="text-[10px] uppercase text-[#777777]">TOTAL DOCUMENTS</div>
-                <div className="text-2xl font-bold mt-1">
-                  {analytics.live_metrics.total_documents}
-                </div>
-              </div>
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-4">
-                <div className="text-[10px] uppercase text-[#777777]">TOTAL CHUNKS</div>
-                <div className="text-2xl font-bold text-[#FF4F00] mt-1">
-                  {analytics.live_metrics.total_chunks}
-                </div>
-              </div>
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-4">
-                <div className="text-[10px] uppercase text-[#777777]">CACHE ENTRIES</div>
-                <div className="text-2xl font-bold mt-1">
-                  {analytics.live_metrics.cache_entries}
-                </div>
-              </div>
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-4">
-                <div className="text-[10px] uppercase text-[#777777]">CACHE HIT RATE</div>
-                <div className="text-2xl font-bold text-[#1B642C] mt-1">
-                  {(analytics.live_metrics.cache_hit_rate * 100).toFixed(1)}%
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Comparison Table */}
-          {analytics?.benchmarks?.metrics && (
-            <div className="space-y-4">
-              <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[#555555]">
-                12-QUESTION BENCHMARK RESULTS (K=5)
-              </h2>
-
-              <div className="border border-[#D4D2C8] bg-[#FAF9F5] overflow-hidden">
-                <table className="w-full text-left font-mono text-xs divide-y divide-[#D4D2C8]">
-                  <thead className="bg-[#EFECE1] text-[#555555]">
-                    <tr>
-                      <th className="py-2.5 px-4 font-bold">RETRIEVAL MODE</th>
-                      <th className="py-2.5 px-4 font-bold">RECALL@5</th>
-                      <th className="py-2.5 px-4 font-bold">PRECISION@5</th>
-                      <th className="py-2.5 px-4 font-bold">MRR (MEAN RECIPROCAL RANK)</th>
-                      <th className="py-2.5 px-4 font-bold">P95 LATENCY (MS)</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#D4D2C8]">
-                    {Object.entries(analytics.benchmarks.metrics).map(([mode, m]) => (
-                      <tr
-                        key={mode}
-                        className={mode === 'hybrid_rrf' ? 'bg-[#FFF8F2] font-semibold' : ''}
-                      >
-                        <td className="py-3 px-4 flex items-center space-x-2">
-                          <span className={mode === 'hybrid_rrf' ? 'text-[#FF4F00]' : ''}>
-                            {mode.toUpperCase()}
-                          </span>
-                          {mode === 'hybrid_rrf' && (
-                            <span className="text-[9px] bg-[#FF4F00] text-white px-1.5 py-0.2">
-                              OPTIMAL
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4">{m.recall_at_5.toFixed(4)}</td>
-                        <td className="py-3 px-4">{m.precision_at_5.toFixed(4)}</td>
-                        <td className="py-3 px-4 text-[#FF4F00] font-bold">
-                          {m.mrr.toFixed(4)}
-                        </td>
-                        <td className="py-3 px-4">{m.p95_latency_ms} ms</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* Horizontal Bar Charts for MRR & Latency */}
-              <div className="grid grid-cols-2 gap-6 pt-4">
-                <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-5">
-                  <div className="text-xs font-mono font-bold uppercase text-[#555555] mb-4">
-                    MRR (HIGHER IS BETTER)
-                  </div>
-                  <div className="h-48">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart
-                        layout="vertical"
-                        data={[
-                          { name: 'Vector', mrr: analytics.benchmarks.metrics.vector_only?.mrr || 0 },
-                          { name: 'BM25', mrr: analytics.benchmarks.metrics.bm25_only?.mrr || 0 },
-                          { name: 'Hybrid RRF', mrr: analytics.benchmarks.metrics.hybrid_rrf?.mrr || 0 },
-                        ]}
-                        margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
-                      >
-                        <CartesianGrid strokeDasharray="3 3" stroke="#D4D2C8" />
-                        <XAxis type="number" domain={[0.8, 1.0]} stroke="#777777" tick={{ fontSize: 10 }} />
-                        <YAxis dataKey="name" type="category" stroke="#111111" tick={{ fontSize: 11 }} />
-                        <Tooltip />
-                        <Bar dataKey="mrr" fill="#FF4F00">
-                          <Cell fill="#888888" />
-                          <Cell fill="#555555" />
-                          <Cell fill="#FF4F00" />
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-
-                <div className="border border-[#D4D2C8] bg-[#FAF9F5] p-5">
-                  <div className="text-xs font-mono font-bold uppercase text-[#555555] mb-4">
-                    P95 LATENCY MS (LOWER IS BETTER)
-                  </div>
-                  <div className="h-48">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart
-                        layout="vertical"
-                        data={[
-                          { name: 'Vector', latency: analytics.benchmarks.metrics.vector_only?.p95_latency_ms || 0 },
-                          { name: 'BM25', latency: analytics.benchmarks.metrics.bm25_only?.p95_latency_ms || 0 },
-                          { name: 'Hybrid RRF', latency: analytics.benchmarks.metrics.hybrid_rrf?.p95_latency_ms || 0 },
-                        ]}
-                        margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
-                      >
-                        <CartesianGrid strokeDasharray="3 3" stroke="#D4D2C8" />
-                        <XAxis type="number" stroke="#777777" tick={{ fontSize: 10 }} />
-                        <YAxis dataKey="name" type="category" stroke="#111111" tick={{ fontSize: 11 }} />
-                        <Tooltip />
-                        <Bar dataKey="latency" fill="#111111">
-                          <Cell fill="#888888" />
-                          <Cell fill="#1B642C" />
-                          <Cell fill="#FF4F00" />
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
+          <Inspector result={result} />
         </main>
       )}
     </div>

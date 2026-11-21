@@ -1,157 +1,151 @@
-import os
+import hashlib
 import json
-import time
-from typing import List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import logging
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from pathlib import Path
+from threading import Lock
+from time import perf_counter
+from urllib.parse import quote
+
+import pymupdf
+from fastapi import APIRouter, FastAPI, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from app.core.config import settings
-from app.schemas.rag import QueryRequest, QueryResponse, ChunkResult, DocumentInfo
-from app.services.hybrid_engine import hybrid_engine
-from app.services.agent_graph import agent_app
+from app.core.config import ROOT, settings
+from app.schemas.rag import DocumentInfo, QueryRequest, QueryResponse
+from app.services.agent_graph import run_query
+from app.services.demo import EXAMPLES, NOTICES, demo_pdf, demo_snapshot
+from app.services.hybrid_engine import Workspace, add_embeddings, extract_pdf
+from evaluation.run_benchmarks import run_benchmark
 
-app = FastAPI(
-    title="VeriRAG Engine",
-    description="Auditable Hybrid RAG Engineering Workbench with RRF & Self-Correction",
-    version="1.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# In-memory query cache for hackathon latency & hit tracking
-query_cache: Dict[str, Dict[str, Any]] = {}
+logger = logging.getLogger(__name__)
+MAX_UPLOAD = 10 * 1024 * 1024
+CACHE_LIMIT = 128
+workspace = Workspace(settings.INDEX_PATH)
+cache = OrderedDict()
+cache_lock = Lock()
 cache_stats = {"hits": 0, "misses": 0}
 
 
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "service": "VeriRAG Engine",
-        "gemini_configured": bool(settings.GEMINI_API_KEY)
-    }
+@asynccontextmanager
+async def lifespan(_app):
+    workspace.import_legacy(settings.CHROMA_PERSIST_DIR)
+    yield
 
 
-@app.post("/documents/upload", response_model=Dict[str, Any])
-async def upload_document(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+app = FastAPI(title="DataScout · VeriRAG", version="2.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
+# Keep the prototype’s API paths for direct callers and add a same-origin prefix for the UI.
+routes = APIRouter()
+
+
+@routes.get("/health")
+def health():
+    return {"status": "healthy", "service": "DataScout", "gemini_configured": bool(settings.GEMINI_API_KEY),
+            "web_configured": bool(settings.GEMINI_API_KEY and settings.TAVILY_API_KEY)}
+
+
+@routes.get("/demo")
+def get_demo():
+    _, documents = demo_snapshot()
+    return {"documents": documents, "examples": EXAMPLES}
+
+
+@routes.get("/demo/documents/{filename}")
+def open_demo_pdf(filename: str):
+    if filename not in NOTICES:
+        raise HTTPException(404, "Demo document not found.")
+    return Response(demo_pdf(filename), media_type="application/pdf",
+                    headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"})
+
+
+@routes.post("/documents/upload")
+def upload_document(file: UploadFile):
+    filename = Path((file.filename or "").replace(chr(92), "/")).name
+    if len(filename) > 150 or not filename.lower().endswith(".pdf") or any(ord(c) < 32 for c in filename):
+        raise HTTPException(400, "Choose a PDF file with a valid filename.")
+    content = file.file.read(MAX_UPLOAD + 1)
+    if len(content) > MAX_UPLOAD:
+        raise HTTPException(413, "PDF files can be up to 10 MB.")
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(400, "The uploaded file is not a readable PDF.")
     try:
-        content = await file.read()
-        chunks = hybrid_engine.extract_and_chunk_pdf(content, file.filename)
-        indexed_count = hybrid_engine.index_chunks(chunks)
-        # Clear cache when knowledge base changes
-        query_cache.clear()
-        return {
-            "message": f"Successfully indexed {file.filename}",
-            "filename": file.filename,
-            "chunks_indexed": indexed_count
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
+        passages, pages = extract_pdf(content, filename)
+    except (pymupdf.FileDataError, RuntimeError) as exc:
+        raise HTTPException(400, "The PDF could not be read.") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    workspace.replace(filename, pages, add_embeddings(passages))
+    return {"message": f"Indexed {filename}", "filename": filename, "chunks_indexed": len(passages),
+            "page_count": pages}
 
 
-@app.get("/documents", response_model=List[DocumentInfo])
+@routes.get("/documents", response_model=list[DocumentInfo])
 def get_documents():
-    return hybrid_engine.list_documents()
+    return workspace.snapshot()[1]
 
 
-@app.get("/analytics")
+@routes.get("/analytics")
 def get_analytics():
-    benchmark_file = "backend/data/benchmark_results.json"
-    benchmark_data = None
-    if os.path.exists(benchmark_file):
-        try:
-            with open(benchmark_file, "r", encoding="utf-8") as f:
-                benchmark_data = json.load(f)
-        except Exception as e:
-            benchmark_data = {"error": f"Failed to load benchmark data: {str(e)}"}
-
-    total_chunks = len(hybrid_engine.chunks_store)
-    documents = hybrid_engine.list_documents()
-    total_docs = len(documents)
-
-    total_cache_requests = cache_stats["hits"] + cache_stats["misses"]
-    hit_rate = round(cache_stats["hits"] / total_cache_requests, 4) if total_cache_requests > 0 else 0.0
-
-    return {
-        "status": "success",
-        "live_metrics": {
-            "total_documents": total_docs,
-            "total_chunks": total_chunks,
-            "cache_entries": len(query_cache),
-            "cache_hits": cache_stats["hits"],
-            "cache_misses": cache_stats["misses"],
-            "cache_hit_rate": hit_rate,
-            "documents": documents
-        },
-        "benchmarks": benchmark_data
-    }
+    passages, documents = workspace.snapshot()
+    with cache_lock:
+        hits, misses, entries = cache_stats["hits"], cache_stats["misses"], len(cache)
+    return {"status": "success", "live_metrics": {
+        "total_documents": len(documents), "total_chunks": len(passages), "cache_entries": entries,
+        "cache_hits": hits, "cache_misses": misses, "cache_hit_rate": hits / (hits + misses) if hits + misses else 0,
+        "documents": documents,
+    }, "benchmarks": run_benchmark()}
 
 
-@app.post("/query", response_model=QueryResponse)
+@routes.post("/query", response_model=QueryResponse)
 def query_rag(request: QueryRequest):
-    start_time = time.time()
-    cache_key = request.query.strip().lower()
+    start = perf_counter()
+    passages, documents = demo_snapshot() if request.workspace == "demo" else workspace.snapshot()
+    if set(request.sources) - {doc["filename"] for doc in documents}:
+        raise HTTPException(422, "A selected document could not be found.")
+    if request.sources:
+        passages = [c for c in passages if c.source in request.sources]
 
-    if cache_key in query_cache:
-        cache_stats["hits"] += 1
-        cached = query_cache[cache_key]
-        latency_ms = round((time.time() - start_time) * 1000, 2)
-        return QueryResponse(
-            answer=cached["answer"],
-            source_mode=cached["source_mode"],
-            trace_steps=cached["trace_steps"] + ["cache_hit_retrieval"],
-            chunks=cached["chunks"],
-            web_sources=cached.get("web_sources", []),
-            cache_hit=True,
-            latency_ms=latency_ms
-        )
+    # Cache only the deterministic demo and key it by query, scope and retrieval limit.
+    key = hashlib.sha256(json.dumps([
+        request.query, request.top_k, sorted(set(request.sources)),
+    ]).encode()).hexdigest() if request.workspace == "demo" else None
+    with cache_lock:
+        cached = cache.get(key)
+        if cached:
+            cache_stats["hits"] += 1
+            cache.move_to_end(key)
+        elif key:
+            cache_stats["misses"] += 1
 
-    cache_stats["misses"] += 1
+    def elapsed() -> float:
+        return round((perf_counter() - start) * 1000, 2)
 
-    initial_state = {
-        "question": request.query,
-        "rewritten_query": None,
-        "retry_count": 0,
-        "chunks": [],
-        "web_sources": [],
-        "source_mode": "none",
-        "trace_steps": ["start_workflow"],
-        "answer": ""
-    }
-
+    if cached:
+        return cached.model_copy(update={"cache_hit": True, "latency_ms": elapsed(),
+                                         "trace_steps": [*cached.trace_steps, "Reused the demo result."]})
     try:
-        final_state = agent_app.invoke(initial_state)
-    except Exception as e:
-        latency_ms = round((time.time() - start_time) * 1000, 2)
-        return QueryResponse(
-            answer=f"Error executing agent pipeline: {str(e)}",
-            source_mode="none",
-            trace_steps=["start_workflow", f"error: {str(e)}"],
-            chunks=[],
-            web_sources=[],
-            cache_hit=False,
-            latency_ms=latency_ms
-        )
+        result = QueryResponse(**run_query(request, passages), latency_ms=elapsed())
+    except Exception as exc:
+        logger.exception("Evidence workflow failed.")
+        raise HTTPException(503, "The evidence workflow was interrupted. Please try again.") from exc
+    if key:
+        with cache_lock:
+            cache[key] = result
+            cache.move_to_end(key)
+            if len(cache) > CACHE_LIMIT:
+                cache.popitem(last=False)
+    return result
 
-    latency_ms = round((time.time() - start_time) * 1000, 2)
-    result_data = {
-        "answer": final_state.get("answer", ""),
-        "source_mode": final_state.get("source_mode", "none"),
-        "trace_steps": final_state.get("trace_steps", []),
-        "chunks": final_state.get("chunks", []),
-        "web_sources": final_state.get("web_sources", []),
-        "cache_hit": False,
-        "latency_ms": latency_ms
-    }
 
-    query_cache[cache_key] = result_data
-    return QueryResponse(**result_data)
+app.include_router(routes, prefix="/api")
+app.include_router(routes, include_in_schema=False)
+frontend_dist = ROOT / "frontend" / "dist"
+if (frontend_dist / "index.html").exists():
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

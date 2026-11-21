@@ -1,268 +1,254 @@
-import os
+import hashlib
+import json
+import logging
 import re
-import pymupdf as fitz
-from typing import List, Dict, Any, Tuple
-import chromadb
-from rank_bm25 import BM25Okapi
+import sqlite3
+from collections import Counter
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pymupdf
 from google import genai
 from google.genai import types
+from rank_bm25 import BM25Okapi
 
 from app.core.config import settings
 from app.schemas.rag import ChunkResult
 
+logger = logging.getLogger(__name__)
+STOP = set("a an and are as at be by can could did do does for from how i in is it me of on or our please should tell that the their this to us was we were what when where which who will with would you your".split())
+WORDS = re.compile(r"[^\W_]+(?:[-_][^\W_]+)*", re.UNICODE)
+CHUNK_SIZE = 650
+MAX_PAGES = 120
+MAX_CHUNKS = 1200
 
-def tokenize(text: str) -> List[str]:
-    return re.findall(r"\w+", text.lower())
+
+@dataclass(frozen=True)
+class Passage:
+    chunk_id: str
+    source: str
+    page: int
+    text: str
+    vector: list[float] | None = None
+    model: str = ""
 
 
-class HybridEngine:
-    def __init__(self):
-        os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
-        self.chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
-        self.collection = self.chroma_client.get_or_create_collection(
-            name="verirag_documents",
-            metadata={"hnsw:space": "cosine"}
-        )
-        
-        self.gemini_client = None
-        if settings.GEMINI_API_KEY:
-            self.gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+def tokens(text: str) -> list[str]:
+    return [token for token in WORDS.findall(text.casefold()) if token not in STOP]
 
-        self.chunks_store: List[Dict[str, Any]] = []
-        self.bm25: BM25Okapi = None
-        self._load_existing_chunks()
 
-    def _get_embedding(self, text: str) -> List[float]:
-        if not self.gemini_client:
-            raise ValueError("GEMINI_API_KEY is not configured.")
-        response = self.gemini_client.models.embed_content(
-            model=settings.EMBEDDING_MODEL,
-            contents=text
-        )
-        # Handle embedding output structure
-        if hasattr(response, "embedding"):
-            return response.embedding.values
-        elif hasattr(response, "embeddings") and response.embeddings:
-            return response.embeddings[0].values
-        raise ValueError("Could not extract embedding from Gemini response.")
-
-    def _load_existing_chunks(self):
-        """Loads all existing documents from ChromaDB to populate in-memory BM25 index."""
-        existing = self.collection.get()
-        if existing and existing.get("ids"):
-            self.chunks_store = []
-            tokenized_corpus = []
-            for i, chunk_id in enumerate(existing["ids"]):
-                meta = existing["metadatas"][i] if existing.get("metadatas") else {}
-                doc_text = existing["documents"][i] if existing.get("documents") else ""
-                item = {
-                    "chunk_id": chunk_id,
-                    "text": doc_text,
-                    "source": meta.get("source", "unknown"),
-                    "page": meta.get("page", 1)
-                }
-                self.chunks_store.append(item)
-                tokenized_corpus.append(tokenize(doc_text))
-            
-            if tokenized_corpus:
-                self.bm25 = BM25Okapi(tokenized_corpus)
-
-    def extract_and_chunk_pdf(self, file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
-        """
-        Extract text page by page using PyMuPDF and split into 500-char chunks
-        with 50-char sliding window overlap, preserving metadata.
-        """
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        chunks = []
-        chunk_idx = 0
-
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            text = page.get_text()
-            if not text:
-                continue
-
-            cleaned_text = " ".join(text.split())
-            if not cleaned_text:
-                continue
-
-            # Sliding window of CHUNK_SIZE characters with CHUNK_OVERLAP overlap
-            step = settings.CHUNK_SIZE - settings.CHUNK_OVERLAP
-            for start in range(0, len(cleaned_text), step):
-                chunk_text = cleaned_text[start : start + settings.CHUNK_SIZE]
-                if not chunk_text.strip():
-                    continue
-
-                chunk_id = f"{filename}_p{page_num + 1}_c{chunk_idx}"
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "text": chunk_text,
-                    "source": filename,
-                    "page": page_num + 1
-                })
-                chunk_idx += 1
-
-        return chunks
-
-    def index_chunks(self, chunks: List[Dict[str, Any]]) -> int:
-        """
-        Synchronously indexes chunks into ChromaDB and rebuilds the BM25 index.
-        """
-        if not chunks:
-            return 0
-
-        ids = [c["chunk_id"] for c in chunks]
-        documents = [c["text"] for c in chunks]
-        metadatas = [{"source": c["source"], "page": c["page"]} for c in chunks]
-
-        # Generate embeddings
-        embeddings = [self._get_embedding(doc) for doc in documents]
-
-        # Upsert into ChromaDB
-        self.collection.upsert(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )
-
-        # Update in-memory chunk store and BM25 index
-        for c in chunks:
-            # Replace if already exists, else append
-            existing_idx = next((i for i, item in enumerate(self.chunks_store) if item["chunk_id"] == c["chunk_id"]), None)
-            if existing_idx is not None:
-                self.chunks_store[existing_idx] = c
-            else:
-                self.chunks_store.append(c)
-
-        tokenized_corpus = [tokenize(c["text"]) for c in self.chunks_store]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-        return len(chunks)
-
-    def list_documents(self) -> List[Dict[str, Any]]:
-        counts: Dict[str, int] = {}
-        for c in self.chunks_store:
-            src = c["source"]
-            counts[src] = counts.get(src, 0) + 1
-        return [{"filename": src, "chunk_count": count} for src, count in counts.items()]
-
-    def search_bm25(self, query: str, top_k: int = 10) -> List[Tuple[str, int, float]]:
-        """Returns list of (chunk_id, rank, score) sorted by BM25 score."""
-        if not self.bm25 or not self.chunks_store:
-            return []
-
-        tokens = tokenize(query)
-        if not tokens:
-            return []
-
-        scores = self.bm25.get_scores(tokens)
-        scored_chunks = [
-            (self.chunks_store[i]["chunk_id"], scores[i])
-            for i in range(len(self.chunks_store))
-            if scores[i] > 0
-        ]
-        scored_chunks.sort(key=lambda x: x[1], reverse=True)
-        return [(cid, rank + 1, score) for rank, (cid, score) in enumerate(scored_chunks[:top_k])]
-
-    def search_vector(self, query: str, top_k: int = 10) -> List[Tuple[str, int, float]]:
-        """Returns list of (chunk_id, rank, distance) sorted by vector similarity."""
-        if self.collection.count() == 0:
-            return []
-
-        query_embedding = self._get_embedding(query)
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(top_k, self.collection.count())
-        )
-
-        ranked = []
-        if results and results.get("ids") and results["ids"][0]:
-            for rank, (cid, dist) in enumerate(zip(results["ids"][0], results["distances"][0])):
-                ranked.append((cid, rank + 1, dist))
-        return ranked
-
-    def hybrid_search(self, query: str, top_k: int = 5) -> List[ChunkResult]:
-        """
-        Reciprocal Rank Fusion (RRF):
-        RRF(d) = sum(1 / (k + rank(d)))
-        Combines BM25 and Vector rankings.
-        """
-        if not self.chunks_store:
-            return []
-
-        search_k = max(top_k * 2, 20)
-        bm25_results = self.search_bm25(query, top_k=search_k)
-        vector_results = self.search_vector(query, top_k=search_k)
-
-        bm25_rank_map = {cid: rank for cid, rank, _ in bm25_results}
-        vector_rank_map = {cid: rank for cid, rank, _ in vector_results}
-
-        all_cids = set(bm25_rank_map.keys()) | set(vector_rank_map.keys())
-        k = settings.RRF_K
-
-        scored_results = []
-        chunk_lookup = {c["chunk_id"]: c for c in self.chunks_store}
-
-        for cid in all_cids:
-            score = 0.0
-            if cid in bm25_rank_map:
-                score += 1.0 / (k + bm25_rank_map[cid])
-            if cid in vector_rank_map:
-                score += 1.0 / (k + vector_rank_map[cid])
-
-            chunk_meta = chunk_lookup.get(cid)
-            if not chunk_meta:
-                continue
-
-            scored_results.append({
-                "chunk_id": cid,
-                "text": chunk_meta["text"],
-                "source": chunk_meta["source"],
-                "page": chunk_meta["page"],
-                "rrf_score": round(score, 6),
-                "bm25_rank": bm25_rank_map.get(cid),
-                "vector_rank": vector_rank_map.get(cid),
-                "is_relevant": None
-            })
-
-        scored_results.sort(key=lambda x: x["rrf_score"], reverse=True)
-        top_chunks = scored_results[:top_k]
-        return [ChunkResult(**item) for item in top_chunks]
-
-    def generate_answer(self, query: str, chunks: List[ChunkResult]) -> str:
-        """
-        Synthesizes a grounded answer with inline citations [filename · p.X]
-        using gemini-2.5-flash.
-        """
-        if not self.gemini_client:
-            raise ValueError("GEMINI_API_KEY is not configured.")
-
-        context_blocks = []
-        for c in chunks:
-            context_blocks.append(f"[{c.source} · p.{c.page}]\n{c.text}")
-        context_str = "\n\n---\n\n".join(context_blocks)
-
-        prompt = f"""You are VeriRAG, an auditable technical RAG assistant.
-Answer the user's question accurately using ONLY the provided context snippets.
-Cite the source for every factual statement using inline citations formatted exactly as: [filename · p.X].
-If the context does not contain enough information to answer the question, state clearly what is missing.
-
-Context:
-{context_str}
-
-User Question:
-{query}
-
-Answer:"""
-
-        response = self.gemini_client.models.generate_content(
-            model=settings.LLM_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
+def extract_pdf(data: bytes, filename: str) -> tuple[list[Passage], int]:
+    passages = []
+    fingerprint = hashlib.sha256(data).hexdigest()[:16]
+    with pymupdf.open(stream=data, filetype="pdf") as pdf:
+        if not pdf.is_pdf:
+            raise ValueError("The uploaded file must be a PDF.")
+        if pdf.needs_pass:
+            raise ValueError("Unlock the PDF before uploading it.")
+        if len(pdf) > MAX_PAGES:
+            raise ValueError(f"PDFs can contain up to {MAX_PAGES} pages.")
+        for page_number, page in enumerate(pdf, 1):
+            lines = [" ".join(line.split()) for line in page.get_text(sort=True).splitlines()]
+            parts = []
+            batch = ""
+            for line in filter(None, lines):
+                if len(batch) + len(line) + 1 > CHUNK_SIZE and batch:
+                    parts.append(batch)
+                    batch = ""
+                if len(line) > CHUNK_SIZE:
+                    for start in range(0, len(line), CHUNK_SIZE - 80):
+                        parts.append(line[start:start + CHUNK_SIZE])
+                        if start + CHUNK_SIZE >= len(line):
+                            break
+                else:
+                    batch = f"{batch}\n{line}" if batch else line
+            if batch:
+                parts.append(batch)
+            if len(passages) + len(parts) > MAX_CHUNKS:
+                raise ValueError("This PDF has too much text. Split it into smaller documents.")
+            passages.extend(
+                Passage(f"{filename}:{fingerprint}:{page_number}:{i}", filename, page_number, part)
+                for i, part in enumerate(parts, 1)
             )
+        if not passages:
+            raise ValueError("No readable text was found. Use a text PDF or run OCR first.")
+        return passages, len(pdf)
+
+
+class Workspace:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path)
+        db.execute("PRAGMA foreign_keys = ON")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS documents (
+                source TEXT PRIMARY KEY, pages INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS passages (
+                id TEXT PRIMARY KEY, source TEXT REFERENCES documents(source) ON DELETE CASCADE,
+                page INTEGER NOT NULL, text TEXT NOT NULL, vector TEXT, model TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY);
+        """)
+        return db
+
+    @staticmethod
+    def _replace(db, source: str, pages: int, passages: list[Passage]):
+        db.execute("DELETE FROM documents WHERE source = ?", (source,))
+        db.execute("INSERT INTO documents VALUES (?, ?)", (source, pages))
+        db.executemany(
+            "INSERT INTO passages VALUES (?, ?, ?, ?, ?, ?)",
+            [(c.chunk_id, c.source, c.page, c.text, json.dumps(c.vector) if c.vector else None, c.model)
+             for c in passages],
         )
-        return response.text.strip()
+
+    def replace(self, source: str, pages: int, passages: list[Passage]):
+        with closing(self.connect()) as db, db:
+            self._replace(db, source, pages, passages)
+
+    def snapshot(self) -> tuple[list[Passage], list[dict]]:
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN")
+            rows = db.execute("SELECT id, source, page, text, vector, model FROM passages ORDER BY source, page, id")
+            passages = [Passage(cid, source, page, text, json.loads(vector) if vector else None, model)
+                        for cid, source, page, text, vector, model in rows]
+            documents = db.execute("""
+                SELECT d.source, COUNT(p.id), d.pages FROM documents d JOIN passages p USING (source)
+                GROUP BY d.source ORDER BY d.source
+            """)
+            return passages, [dict(filename=source, chunk_count=count, page_count=pages)
+                              for source, count, pages in documents]
+
+    def import_legacy(self, path: Path):
+        if not (path / "chroma.sqlite3").is_file():
+            return
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM metadata WHERE key = 'legacy_imported'").fetchone():
+                return
+            import chromadb
+            from chromadb.errors import NotFoundError
+
+            client = chromadb.PersistentClient(path=str(path))
+            try:
+                collection = client.get_collection("verirag_documents", embedding_function=None)
+            except NotFoundError:
+                return
+            data = collection.get(include=["documents", "metadatas"])
+            by_source = {}
+            for cid, body, meta in zip(data["ids"], data["documents"], data["metadatas"], strict=True):
+                source = meta["source"]
+                by_source.setdefault(source, []).append(Passage(cid, source, meta["page"], body))
+            for source, passages in by_source.items():
+                if not db.execute("SELECT 1 FROM documents WHERE source = ?", (source,)).fetchone():
+                    self._replace(db, source, max(c.page for c in passages), passages)
+            db.execute("INSERT INTO metadata VALUES ('legacy_imported')")
 
 
-hybrid_engine = HybridEngine()
+def gemini_client():
+    if settings.GEMINI_API_KEY:
+        return genai.Client(api_key=settings.GEMINI_API_KEY,
+                            http_options=types.HttpOptions(timeout=12_000, retry_options={"attempts": 1}))
+    return None
+
+
+def embeddings(client, texts: list[str], task: str) -> list[list[float]]:
+    response = client.models.embed_content(
+        model=settings.EMBEDDING_MODEL, contents=texts,
+        config=types.EmbedContentConfig(task_type=task, output_dimensionality=768),
+    )
+    vectors = [item.values for item in (response.embeddings or [])]
+    if len(vectors) != len(texts) or any(not v or len(v) != 768 for v in vectors):
+        raise ValueError("Embedding response did not match the requested inputs.")
+    return vectors
+
+
+def add_embeddings(passages: list[Passage]) -> list[Passage]:
+    if not settings.GEMINI_API_KEY:
+        return passages
+    try:
+        with gemini_client() as client:
+            vectors = []
+            for offset in range(0, len(passages), 100):
+                vectors.extend(embeddings(client, [c.text for c in passages[offset:offset + 100]],
+                                          "RETRIEVAL_DOCUMENT"))
+        return [Passage(c.chunk_id, c.source, c.page, c.text, vector, settings.EMBEDDING_MODEL)
+                for c, vector in zip(passages, vectors, strict=True)]
+    except Exception:
+        logger.warning("Gemini embeddings unavailable. Keeping the local search index.")
+        return passages
+
+
+def term_vector(words: list[str]) -> Counter:
+    return Counter(
+        [f"word:{word}" for word in words]
+        + [f"trigram:{word[i:i + 3]}" for word in words if len(word) >= 4
+           for i in range(len(word) - 2)]
+    )
+
+
+def cosine(left: Counter, right: Counter) -> float:
+    dot = sum(weight * right[key] for key, weight in left.items())
+    if not dot:
+        return 0.0
+    return dot / ((sum(w * w for w in left.values()) * sum(w * w for w in right.values())) ** 0.5)
+
+
+class HybridSearch:
+    def __init__(self, passages: list[Passage], allow_cloud: bool = False):
+        self.passages = passages
+        self.allow_cloud = allow_cloud
+        self.mode = "local"
+        self.corpus = [tokens(chunk.text) for chunk in passages]
+        self.vector_corpus = [term_vector(words) for words in self.corpus]
+        self.bm25 = BM25Okapi(self.corpus) if any(self.corpus) else None
+        if self.bm25:
+            # A positive IDF floor keeps exact matches visible even in a one-page library.
+            self.bm25.idf = {term: max(score, 0.25) for term, score in self.bm25.idf.items()}
+
+    def ranked(self, query: str, k: int = 5) -> dict[str, list[ChunkResult]]:
+        words = tokens(query)
+        if not self.bm25 or not words:
+            return {mode: [] for mode in ("bm25_only", "vector_only", "hybrid_rrf")}
+        lexical = self.bm25.get_scores(list(dict.fromkeys(words)))
+        match_vector = term_vector(words)
+        vector = [cosine(match_vector, candidate) for candidate in self.vector_corpus]
+        self.mode = "local"
+        if self.allow_cloud and settings.GEMINI_API_KEY and all(
+            c.vector and c.model == settings.EMBEDDING_MODEL for c in self.passages
+        ):
+            try:
+                with gemini_client() as client:
+                    query_vector = np.asarray(embeddings(client, [query], "RETRIEVAL_QUERY")[0])
+                matrix = np.asarray([c.vector for c in self.passages])
+                denom = np.maximum(np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_vector), 1e-12)
+                vector = matrix @ query_vector / denom
+                self.mode = "gemini"
+            except Exception:
+                logger.warning("Gemini query embedding unavailable. Using local vectors.")
+
+        pool = max(20, k * 2)
+        rank_lists = {}
+        for name, scores in (("bm25_only", lexical), ("vector_only", vector)):
+            ordered = sorted((i for i, score in enumerate(scores) if score > 0),
+                             key=lambda i: (-scores[i], self.passages[i].chunk_id))
+            rank_lists[name] = {i: rank for rank, i in enumerate(ordered[:pool], 1)}
+        bm25_rank, vector_rank = rank_lists.values()
+        fused = {
+            i: sum(1 / (60 + ranks[i]) for ranks in (bm25_rank, vector_rank) if i in ranks)
+            for i in bm25_rank.keys() | vector_rank.keys()
+        }
+        rank_lists["hybrid_rrf"] = sorted(fused, key=lambda i: (-fused[i], self.passages[i].chunk_id))
+
+        def result(i: int) -> ChunkResult:
+            item = self.passages[i]
+            return ChunkResult(chunk_id=item.chunk_id, source=item.source, page=item.page, text=item.text,
+                               rrf_score=round(fused[i], 6), bm25_rank=bm25_rank.get(i),
+                               vector_rank=vector_rank.get(i))
+
+        return {mode: [result(i) for i in list(order)[:k]] for mode, order in rank_lists.items()}
